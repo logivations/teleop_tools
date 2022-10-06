@@ -41,16 +41,27 @@
 import curses
 
 # For 'q' keystroke exit
+import multiprocessing
 import os
 import signal
 import time
+from threading import Thread
 
+from amr_control.lift_level import LiftLevelString
+from amr_interfaces.action import SetLiftLevel, SetLidarField
+from amr_interfaces.msg import LidarStatus
 from geometry_msgs.msg import Twist, TwistStamped
 import rclpy
+from rclpy.action import ActionClient
 from rclpy.duration import Duration
 from rclpy.node import Node
-from rclpy.qos import qos_profile_system_default
-from std_msgs.msg import Header
+from rclpy.qos import qos_profile_system_default, qos_profile_sensor_data
+from std_msgs.msg import Header, Bool
+
+LIFTING_ENABLED = "Lifting enabled"
+LIFTING_DISABLED = "Lifting disabled try again in 5 seconds"
+LIDAR_ENABLED = "Lidar toggle enabled"
+LIDAR_DISABLED = "Lidar toggle disabled try again in 5 seconds"
 
 
 class Velocity(object):
@@ -130,19 +141,33 @@ class SimpleKeyTeleop(Node):
         self._publish_stamped_twist = self.declare_parameter('twist_stamped_enabled', False).value
 
         if self._publish_stamped_twist:
-            self._pub_cmd = self.create_publisher(TwistStamped, 'key_vel',
+            self._pub_cmd = self.create_publisher(TwistStamped, 'cmd_vel',
                                                   qos_profile_system_default)
         else:
-            self._pub_cmd = self.create_publisher(Twist, 'key_vel', qos_profile_system_default)
+            self._pub_cmd = self.create_publisher(Twist, 'cmd_vel', qos_profile_system_default)
 
         self._hz = self.declare_parameter('hz', 10).value
 
-        self._forward_rate = self.declare_parameter('forward_rate', 0.8).value
+        self._forward_rate = self.declare_parameter('forward_rate', 0.5).value
         self._backward_rate = self.declare_parameter('backward_rate', 0.5).value
-        self._rotation_rate = self.declare_parameter('rotation_rate', 1.0).value
+        self._rotation_rate = self.declare_parameter('rotation_rate', 0.1).value
+        self._lidar_field_action_client = ActionClient(self, SetLidarField, "set_lidar_field")
+        self._lift_level_action_client = ActionClient(self, SetLiftLevel, "set_lift_level")
         self._last_pressed = {}
         self._angular = 0
         self._linear = 0
+        self.using_narrow_lidar_field = False
+        self._current_lift_field = LiftLevelString.IDLE.value
+        self._last_lifting = self.get_clock().now() - Duration(seconds=5)
+        self._last_lidar_toggle = self.get_clock().now() - Duration(seconds=5)
+        self._lift_sent_counter = 0
+        self.test = 0
+        self.lidar_subscriber = self.create_subscription(
+            topic="lidar_field",
+            msg_type=LidarStatus,
+            callback=self.update_lidar_status,
+            qos_profile=qos_profile_sensor_data,
+        )
 
     movement_bindings = {
         curses.KEY_UP:    (1,  0),
@@ -150,6 +175,7 @@ class SimpleKeyTeleop(Node):
         curses.KEY_LEFT:  (0,  1),
         curses.KEY_RIGHT: (0, -1),
     }
+    sensory_bindings = [ord('n'), ord('u'), ord('i')]
 
     def run(self):
         self._running = True
@@ -159,9 +185,10 @@ class SimpleKeyTeleop(Node):
                 if keycode is None:
                     break
                 self._key_pressed(keycode)
-            self._set_velocity()
-            self._publish()
+            self._process_keys()
+            self.publish()
             # TODO(artivis) use Rate once available
+            rclpy.spin_once(self)
             time.sleep(1.0/self._hz)
 
     def _make_twist(self, linear, angular):
@@ -181,15 +208,22 @@ class SimpleKeyTeleop(Node):
         twist_stamped.twist.angular.z = angular
         return twist_stamped
 
-    def _set_velocity(self):
+    def _process_keys(self):
         now = self.get_clock().now()
         keys = []
         for a in self._last_pressed:
             if now - self._last_pressed[a] < Duration(seconds=0.4):
                 keys.append(a)
+        self._set_velocity(keys)
+        self._set_lidar(keys)
+        self._set_lift(keys)
+
+    def _set_velocity(self, keys):
         linear = 0.0
         angular = 0.0
         for k in keys:
+            if k not in self.movement_bindings:
+                continue
             l, a = self.movement_bindings[k]
             linear += l
             angular += a
@@ -201,18 +235,48 @@ class SimpleKeyTeleop(Node):
         self._angular = angular
         self._linear = linear
 
+    def _set_lidar(self, keys):
+        for k in keys:
+            now = self.get_clock().now()
+            if k == ord('n') and now - self._last_lidar_toggle > Duration(seconds=5.0):
+                goal_msg = SetLidarField.Goal()
+                goal_msg.use_narrow_field = Bool(data=not self.using_narrow_lidar_field)
+                self._lidar_field_action_client.send_goal_async(goal_msg)
+                self._last_lidar_toggle = now
+
+    def _set_lift(self, keys):
+        self._current_lift_field = LiftLevelString.IDLE.value
+        for k in keys:
+            if k == ord('u'):
+                self._current_lift_field = LiftLevelString.LOWERED.value
+            elif k == ord('i'):
+                self._current_lift_field = LiftLevelString.LIFTED_HIGH.value
+
+        now = self.get_clock().now()
+        if now - self._last_lifting > Duration(seconds=5.0) and self._current_lift_field != LiftLevelString.IDLE.value:
+            #process lifting with 5 seconds throttle
+            goal_msg = SetLiftLevel.Goal()
+            goal_msg.lift_level = self._current_lift_field
+            self._lift_level_action_client.send_goal_async(goal_msg)
+            self._last_lifting = now
+
     def _key_pressed(self, keycode):
         if keycode == ord('q'):
             self._running = False
             # TODO(artivis) no rclpy.signal_shutdown ?
             os.kill(os.getpid(), signal.SIGINT)
-        elif keycode in self.movement_bindings:
+        elif keycode in self.movement_bindings or keycode in self.sensory_bindings:
             self._last_pressed[keycode] = self.get_clock().now()
 
-    def _publish(self):
+    def publish(self):
         self._interface.clear()
-        self._interface.write_line(2, 'Linear: %f, Angular: %f' % (self._linear, self._angular))
-        self._interface.write_line(5, 'Use arrow keys to move, q to exit.')
+        self._interface.write_line(2, 'dgd Linear: %f, Angular: %f' % (self._linear, self._angular))
+        self._interface.write_line(3, f'Using narrow lidar field: {self.using_narrow_lidar_field}')
+        self._interface.write_line(4, f'Current lift level: {self._current_lift_field}')
+        self._interface.write_line(5, f'Current lift level: {self.test}')
+        self._interface.write_line(6, 'Use arrow keys to move, n to toggle between lidar fields, u/i for moving the lift, q to exit.')
+        self._interface.write_line(7, f'{LIFTING_ENABLED if self.get_clock().now() - self._last_lifting  > Duration(seconds=5.0) else LIFTING_DISABLED}')
+        self._interface.write_line(8, f'{LIDAR_ENABLED if self.get_clock().now() - self._last_lidar_toggle  > Duration(seconds=5.0) else LIDAR_DISABLED}, count {self._lift_sent_counter}')
         self._interface.refresh()
 
         if self._publish_stamped_twist:
@@ -221,6 +285,9 @@ class SimpleKeyTeleop(Node):
             twist = self._make_twist(self._linear, self._angular)
 
         self._pub_cmd.publish(twist)
+
+    def update_lidar_status(self, msg: LidarStatus):
+        self.using_narrow_lidar_field = msg.narrow_field.data or msg.putdown_field.data or msg.putdown_field.data
 
 
 def execute(stdscr):
