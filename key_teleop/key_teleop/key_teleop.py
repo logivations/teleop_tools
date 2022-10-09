@@ -56,7 +56,7 @@ from rclpy.action import ActionClient
 from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import qos_profile_system_default, qos_profile_sensor_data
-from std_msgs.msg import Header, Bool
+from std_msgs.msg import Header, Bool, Float32
 
 LIFTING_ENABLED = "Lifting enabled"
 LIFTING_DISABLED = "Lifting disabled try again in 5 seconds"
@@ -148,8 +148,8 @@ class SimpleKeyTeleop(Node):
 
         self._hz = self.declare_parameter('hz', 10).value
 
-        self._forward_rate = self.declare_parameter('forward_rate', 0.5).value
-        self._backward_rate = self.declare_parameter('backward_rate', 0.5).value
+        self._forward_rate = self.declare_parameter('forward_rate', 0.2).value
+        self._backward_rate = self.declare_parameter('backward_rate', 0.15).value
         self._rotation_rate = self.declare_parameter('rotation_rate', 0.1).value
         self._lidar_field_action_client = ActionClient(self, SetLidarField, "set_lidar_field")
         self._lift_level_action_client = ActionClient(self, SetLiftLevel, "set_lift_level")
@@ -161,13 +161,20 @@ class SimpleKeyTeleop(Node):
         self._last_lifting = self.get_clock().now() - Duration(seconds=5)
         self._last_lidar_toggle = self.get_clock().now() - Duration(seconds=5)
         self._lift_sent_counter = 0
-        self.test = 0
+        self.last_command_sent_ts = self.get_clock().now()
         self.lidar_subscriber = self.create_subscription(
             topic="lidar_field",
             msg_type=LidarStatus,
             callback=self.update_lidar_status,
             qos_profile=qos_profile_sensor_data,
         )
+        self.lift_height_subscriber = self.create_subscription(
+            topic="lift_height",
+            msg_type=Float32,
+            callback=self.update_lift_height,
+            qos_profile=qos_profile_sensor_data,
+        )
+        self.current_lift_height = 0
 
     movement_bindings = {
         curses.KEY_UP:    (1,  0),
@@ -238,7 +245,7 @@ class SimpleKeyTeleop(Node):
     def _set_lidar(self, keys):
         for k in keys:
             now = self.get_clock().now()
-            if k == ord('n') and now - self._last_lidar_toggle > Duration(seconds=5.0):
+            if k == ord('n') and now - self._last_lidar_toggle > Duration(seconds=2.0):
                 goal_msg = SetLidarField.Goal()
                 goal_msg.use_narrow_field = Bool(data=not self.using_narrow_lidar_field)
                 self._lidar_field_action_client.send_goal_async(goal_msg)
@@ -270,13 +277,11 @@ class SimpleKeyTeleop(Node):
 
     def publish(self):
         self._interface.clear()
-        self._interface.write_line(2, 'dgd Linear: %f, Angular: %f' % (self._linear, self._angular))
-        self._interface.write_line(3, f'Using narrow lidar field: {self.using_narrow_lidar_field}')
-        self._interface.write_line(4, f'Current lift level: {self._current_lift_field}')
-        self._interface.write_line(5, f'Current lift level: {self.test}')
-        self._interface.write_line(6, 'Use arrow keys to move, n to toggle between lidar fields, u/i for moving the lift, q to exit.')
-        self._interface.write_line(7, f'{LIFTING_ENABLED if self.get_clock().now() - self._last_lifting  > Duration(seconds=5.0) else LIFTING_DISABLED}')
-        self._interface.write_line(8, f'{LIDAR_ENABLED if self.get_clock().now() - self._last_lidar_toggle  > Duration(seconds=5.0) else LIDAR_DISABLED}, count {self._lift_sent_counter}')
+        self._interface.write_line(1, 'PIXEL PT remote control')
+        self._interface.write_line(2, 'Use arrow keys to move, n to toggle narrow lidar fields, u/i for moving the lift, q to exit.')
+        self._interface.write_line(3, 'Linear: %f, Angular: %f' % (self._linear, self._angular))
+        self._interface.write_line(4, f'Lidar: Using {"narrow" if self.using_narrow_lidar_field else "standard" } lidar field ')
+        self._interface.write_line(5, f'Lifting: target level {self._current_lift_field} | current level {self.current_lift_height}')
         self._interface.refresh()
 
         if self._publish_stamped_twist:
@@ -284,10 +289,19 @@ class SimpleKeyTeleop(Node):
         else:
             twist = self._make_twist(self._linear, self._angular)
 
-        self._pub_cmd.publish(twist)
+        if self._linear == 0 and self._angular == 0:
+            # do not send empty commands for a long time
+            if self.get_clock().now() - self.last_command_sent_ts < Duration(seconds=2):
+                self._pub_cmd.publish(twist)
+        else:
+            self.last_command_sent_ts = self.get_clock().now()
+            self._pub_cmd.publish(twist)
 
     def update_lidar_status(self, msg: LidarStatus):
-        self.using_narrow_lidar_field = msg.narrow_field.data or msg.putdown_field.data or msg.putdown_field.data
+        self.using_narrow_lidar_field = msg.narrow_field.data or msg.putdown_field.data
+
+    def update_lift_height(self, msg: Float32):
+        self.current_lift_height = msg.data
 
 
 def execute(stdscr):
