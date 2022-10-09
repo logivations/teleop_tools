@@ -291,6 +291,7 @@ class SimpleKeyTeleop(Node):
 
         if self._linear == 0 and self._angular == 0:
             # do not send empty commands for a long time
+            # otherwise, if someone forgets this window, the 0 speed commands will disturb normal / joystick control
             if self.get_clock().now() - self.last_command_sent_ts < Duration(seconds=2):
                 self._pub_cmd.publish(twist)
         else:
